@@ -74,6 +74,16 @@
 .inv-state-pill:hover { background: #f5f0e5; }
 .inv-state-pill.active { background: #13261e; border-color: #13261e; color: #fffdf3; }
 .inv-state-pill .count { color: inherit; opacity: .65; font: 500 10px 'DM Mono', monospace; }
+.inv-filter-result {
+  margin-left: auto;
+  align-self: center;
+  color: #756f63;
+  font: 600 10.5px 'DM Mono', monospace;
+  white-space: nowrap;
+}
+@media (max-width: 700px) {
+  .inv-filter-result { width: 100%; margin-left: 0; }
+}
 
 /* ─── Inventory table (5+ columns: name, category, price, stock, threshold, actions) ── */
 .inv-thead, .inv-row {

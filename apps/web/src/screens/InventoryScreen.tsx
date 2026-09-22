@@ -26,6 +26,7 @@ import { formatCents } from '../../../../packages/domain/src/money'
 import { posDb } from '../lib/db'
 import { activeStoreId, accessToken, configuredApiUrl } from '../lib/catalog'
 import { resolveFinancialAccess } from '../lib/management-access'
+import { inventoryStatus as computeStatus, matchesInventoryFilters, type InventoryStatus } from './inventory-filter'
 import './product-catalog.css'
 import './inventory.css'
 
@@ -34,8 +35,6 @@ import './inventory.css'
 // contract). Not imported directly since the frontend build does not depend on
 // the API package's source.
 // ---------------------------------------------------------------------------
-
-type InventoryStatus = 'normal' | 'low' | 'out' | 'oversold'
 
 interface InventoryRow {
   product_id: string
@@ -115,13 +114,6 @@ const STATE_LABEL: Record<'all' | InventoryStatus, string> = {
 /** Mirrors apps/api/src/lib/stockable.ts's inventoryStatus() exactly, so a
  * locally-applied mutation (adjust / cycle-count submit / threshold change) can
  * recompute a row's pill state without a full refetch. */
-function computeStatus(currentStock: number, lowStockThreshold: number): InventoryStatus {
-  if (currentStock < 0) return 'oversold'
-  if (currentStock === 0) return 'out'
-  if (currentStock <= lowStockThreshold) return 'low'
-  return 'normal'
-}
-
 function pillInfo(status: InventoryStatus): { cls: string; label: string } {
   if (status === 'normal') return { cls: 'in', label: 'In Stock' }
   if (status === 'low') return { cls: 'low', label: 'Low Stock' }
@@ -356,20 +348,14 @@ export function InventoryScreen() {
     return Array.from(map.entries()).map(([id, name]) => ({ id, name }))
   }, [items])
 
-  const q = query.trim().toLowerCase()
   const filtered = useMemo(() => {
     if (!items) return []
-    return items.filter((it) => {
-      if (catFilter !== 'all' && it.category_id !== catFilter) return false
-      if (stateFilter !== 'all' && it.status !== stateFilter) return false
-      if (!q) return true
-      return it.name.toLowerCase().includes(q) || it.sku.toLowerCase().includes(q) || (it.barcode ?? '').toLowerCase().includes(q)
-    })
-  }, [items, catFilter, stateFilter, q])
+    return items.filter(it => matchesInventoryFilters(it, query, catFilter, stateFilter))
+  }, [items, catFilter, stateFilter, query])
 
   const stateCounts = useMemo(() => {
     const c: Record<'all' | InventoryStatus, number> = { all: 0, normal: 0, low: 0, out: 0, oversold: 0 }
-    for (const it of items ?? []) { c.all += 1; c[it.status] += 1 }
+    for (const it of items ?? []) { c.all += 1; c[computeStatus(it.current_stock, it.low_stock_threshold)] += 1 }
     return c
   }, [items])
 
@@ -634,10 +620,13 @@ export function InventoryScreen() {
         </div>
         <div className="inv-state-filters" style={{ marginBottom: 18 }}>
           {(['all', 'normal', 'low', 'out', 'oversold'] as const).map((s) => (
-            <button key={s} type="button" className={`inv-state-pill ${stateFilter === s ? 'active' : ''}`} onClick={() => setStateFilter(s)}>
+            <button key={s} type="button" aria-pressed={stateFilter === s} className={`inv-state-pill ${stateFilter === s ? 'active' : ''}`} onClick={() => setStateFilter(s)}>
               {STATE_LABEL[s]} <span className="count">{stateCounts[s]}</span>
             </button>
           ))}
+          <span className="inv-filter-result" role="status" aria-live="polite">
+            Showing {filtered.length} of {items?.length ?? 0} products
+          </span>
         </div>
 
         {mode === 'list' && (
