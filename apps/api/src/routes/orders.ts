@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { Router } from 'express'
 import { db } from '../db.js'
 import { ApiError, requireStoreMember, requireStoreManager, sendApiError } from './auth.js'
-import { boundedInteger, calculateDiscountedLine, discountNeedsManagerApproval, MAX_CENTS, sumDiscountedLines, type LineDiscount } from '../../../../packages/domain/src/money.js'
+import { allocateReturnCents, boundedInteger, calculateDiscountedLine, discountNeedsManagerApproval, MAX_CENTS, sumDiscountedLines, type LineDiscount } from '../../../../packages/domain/src/money.js'
 import { requireCashierTerminal, requireDeviceTerminal } from '../terminal-auth/routes.js'
 
 export const ordersRouter = Router()
@@ -32,6 +32,39 @@ function timestamp(value: unknown, name: string): string {
     throw new ApiError(422, 'validation_failed', `${name} must be a valid UTC timestamp.`)
   }
   return result
+}
+const RETURN_REASONS = ['damaged', 'customer_changed_mind', 'incorrect_item', 'pricing_error', 'other'] as const
+type ReturnReason = typeof RETURN_REASONS[number]
+type ReturnLineRequest = { order_item_id: string; quantity: number; restock_quantity: number }
+function parseReturnRequest(raw: unknown) {
+  const body = record(raw, 'Return')
+  const storeId = id(body.store_id, 'Store ID')
+  const operationId = id(body.operation_id, 'Operation ID')
+  const reason = body.reason
+  if (!RETURN_REASONS.includes(reason as ReturnReason)) throw new ApiError(422, 'validation_failed', 'Return reason is invalid.')
+  const reasonNote = body.reason_note === undefined || body.reason_note === null || body.reason_note === '' ? null : text(body.reason_note, 'Return note', 500)
+  if (reason === 'other' && !reasonNote) throw new ApiError(422, 'validation_failed', 'A note is required when the return reason is other.')
+  const outcome = body.payment_outcome
+  if (outcome !== 'cash_refund' && outcome !== 'external_card_refund_confirmed') {
+    throw new ApiError(422, 'validation_failed', 'Select cash refund or confirmed external card refund.')
+  }
+  const externalReference = body.external_reference === undefined || body.external_reference === null || body.external_reference === ''
+    ? null : text(body.external_reference, 'External reference', 120)
+  if (outcome === 'external_card_refund_confirmed' && body.external_refund_confirmed !== true) {
+    throw new ApiError(422, 'validation_failed', 'Confirm that the external card refund was completed outside the POS.')
+  }
+  const linesRaw = body.lines
+  if (!Array.isArray(linesRaw) || linesRaw.length < 1 || linesRaw.length > 100) throw new ApiError(422, 'validation_failed', 'Select at least one line to return.')
+  const lines = linesRaw.map((rawLine, index) => {
+    const line = record(rawLine, `Return line ${index + 1}`)
+    const quantity = line.quantity
+    const restockQuantity = line.restock_quantity
+    if (!Number.isInteger(quantity) || (quantity as number) < 1 || (quantity as number) > 10_000) throw new ApiError(422, 'validation_failed', 'Return quantity is invalid.')
+    if (!Number.isInteger(restockQuantity) || (restockQuantity as number) < 0 || (restockQuantity as number) > (quantity as number)) throw new ApiError(422, 'validation_failed', 'Restock quantity cannot exceed returned quantity.')
+    return { order_item_id: id(line.order_item_id, 'Order item ID'), quantity: quantity as number, restock_quantity: restockQuantity as number }
+  })
+  if (new Set(lines.map(line => line.order_item_id)).size !== lines.length) throw new ApiError(422, 'validation_failed', 'Each original line can appear only once in a return.')
+  return { storeId, operationId, reason: reason as ReturnReason, reasonNote, outcome, externalReference, lines }
 }
 // A line may send discount_kind/discount_value together, or omit both for no discount.
 function parseDiscount(item: JsonRecord, label: string): LineDiscount {
@@ -224,6 +257,72 @@ async function push(req: import('express').Request, res: import('express').Respo
 // its own append-only record, per docs/04_er_diagrams.md:98's suggested shape (reference the sale
 // through order_id, the return through a separate refund_id — never the other way around).
 // ---------------------------------------------------------------------------
+async function createReturn(req: import('express').Request, res: import('express').Response) {
+  try {
+    const orderId = id(req.params.id, 'Order ID')
+    const request = parseReturnRequest(req.body)
+    const actorId = await requireStoreManager(req, request.storeId)
+    const hash = createHash('sha256').update(JSON.stringify(req.body)).digest('hex')
+    const client = await db.connect()
+    try {
+      await client.query('begin')
+      await client.query('insert into public.pos_sync_feed_state(store_id) values ($1) on conflict do nothing', [request.storeId])
+      let position = BigInt((await client.query<{ last_position: string }>('select last_position::text as last_position from public.pos_sync_feed_state where store_id=$1 for update', [request.storeId])).rows[0].last_position)
+      const replay = await client.query<{ payload_hash: string; result_json: unknown }>('select payload_hash,result_json from public.pos_operation_ledger where store_id=$1 and operation_id=$2', [request.storeId, request.operationId])
+      if (replay.rows[0]) {
+        if (replay.rows[0].payload_hash !== hash) throw new ApiError(409, 'operation_id_conflict', 'This operation ID was used for a different return.')
+        await client.query('commit'); res.json(replay.rows[0].result_json); return
+      }
+      const order = await client.query('select id,receipt_number from public.pos_orders where store_id=$1 and id=$2', [request.storeId, orderId])
+      if (!order.rows[0]) throw new ApiError(404, 'not_found', 'Order not found.')
+      const itemIds = request.lines.map(line => line.order_item_id)
+      const originals = await client.query<{
+        id: string; product_id: string; quantity: number; subtotal_cents: string; discount_applied_cents: string; tax_cents: string; total_cents: string
+      }>(`select id,product_id,quantity,subtotal_cents::text,discount_applied_cents::text,tax_cents::text,total_cents::text
+          from public.pos_order_items where store_id=$1 and order_id=$2 and id=any($3::uuid[]) for update`, [request.storeId, orderId, itemIds])
+      if (originals.rowCount !== request.lines.length) throw new ApiError(422, 'cross_store_reference', 'A selected line does not belong to this sale.')
+      const returned = await client.query<{ order_item_id: string; quantity: string }>(`select ri.order_item_id, coalesce(sum(ri.quantity),0)::text as quantity
+          from public.pos_refund_items ri join public.pos_refunds r on r.id=ri.refund_id and r.store_id=ri.store_id
+          where ri.store_id=$1 and ri.order_item_id=any($2::uuid[]) group by ri.order_item_id`, [request.storeId, itemIds])
+      const returnedByItem = new Map(returned.rows.map(row => [row.order_item_id, Number(row.quantity)]))
+      const selections = request.lines.map(line => {
+        const original = originals.rows.find(item => item.id === line.order_item_id)!
+        const already = returnedByItem.get(original.id) ?? 0
+        if (line.quantity + already > original.quantity) throw new ApiError(409, 'return_quantity_conflict', 'This return exceeds the quantity originally sold.')
+        return { ...line, original, already,
+          subtotal_cents: allocateReturnCents(Number(original.subtotal_cents), original.quantity, already, line.quantity),
+          discount_cents: allocateReturnCents(Number(original.discount_applied_cents), original.quantity, already, line.quantity),
+          tax_cents: allocateReturnCents(Number(original.tax_cents), original.quantity, already, line.quantity),
+          amount_cents: allocateReturnCents(Number(original.total_cents), original.quantity, already, line.quantity) }
+      })
+      const amount = selections.reduce((sum, line) => sum + line.amount_cents, 0)
+      if (!Number.isSafeInteger(amount) || amount > MAX_CENTS) throw new ApiError(422, 'validation_failed', 'Return amount exceeds the supported limit.')
+      const header = await client.query<{ id: string; created_at: string }>(`insert into public.pos_refunds
+        (store_id,order_id,amount_cents,reason,reason_code,reason_note,payment_outcome,external_reference,operation_id,refunded_by)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id,created_at`,
+        [request.storeId, orderId, amount, request.reasonNote, request.reason, request.reasonNote, request.outcome, request.externalReference, request.operationId, actorId])
+      for (const line of selections) await client.query(`insert into public.pos_refund_items
+        (store_id,refund_id,order_item_id,product_id,quantity,restock_quantity,subtotal_cents,discount_cents,tax_cents,amount_cents)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [request.storeId, header.rows[0].id, line.original.id, line.original.product_id, line.quantity, line.restock_quantity, line.subtotal_cents, line.discount_cents, line.tax_cents, line.amount_cents])
+      for (const line of selections.filter(line => line.restock_quantity > 0)) {
+        await client.query(`insert into public.pos_inventory_movements(store_id,product_id,order_id,operation_id,delta,reason,actor_id)
+          values ($1,$2,$3,gen_random_uuid(),$4,'refund',$5)`, [request.storeId, line.original.product_id, orderId, line.restock_quantity, actorId])
+        const stock = await client.query<{ current_stock: number }>('update public.pos_stock set current_stock=current_stock+$3,updated_at=now() where store_id=$1 and product_id=$2 returning current_stock', [request.storeId, line.original.product_id, line.restock_quantity])
+        if (!stock.rows[0]) throw new ApiError(422, 'cross_store_reference', 'Stock projection is missing for a returned product.')
+        position += 1n
+        await client.query(`insert into public.pos_change_feed(store_id,position,entity_type,entity_id,payload) values ($1,$2,'stock',$3,$4)`, [request.storeId, position.toString(), line.original.product_id, { product_id: line.original.product_id, current_stock: stock.rows[0].current_stock }])
+      }
+      position += 1n
+      await client.query(`insert into public.pos_change_feed(store_id,position,entity_type,entity_id,payload) values ($1,$2,'refund',$3,$4)`, [request.storeId, position.toString(), header.rows[0].id, { order_id: orderId, refund_id: header.rows[0].id, amount_cents: amount }])
+      await client.query('update public.pos_sync_feed_state set last_position=$2 where store_id=$1', [request.storeId, position.toString()])
+      await client.query('insert into public.audit_log(store_id,actor_id,action,target,details) values ($1,$2,$3,$4,$5)', [request.storeId, actorId, 'return.created', `Return ${header.rows[0].id} for ${order.rows[0].receipt_number}: ${amount} cents`, { order_id: orderId, refund_id: header.rows[0].id, reason: request.reason, amount_cents: amount, payment_outcome: request.outcome, lines: selections.map(line => ({ order_item_id: line.original.id, quantity: line.quantity, restock_quantity: line.restock_quantity })) }])
+      const result = { return: { id: header.rows[0].id, order_id: orderId, amount_cents: amount, created_at: header.rows[0].created_at, payment_outcome: request.outcome }, operation_id: request.operationId, accepted_checkpoint: position.toString() }
+      await client.query('insert into public.pos_operation_ledger(store_id,operation_id,payload_hash,status,result_json,accepted_checkpoint) values ($1,$2,$3,$4,$5,$6)', [request.storeId, request.operationId, hash, 'accepted', result, position.toString()])
+      await client.query('commit'); res.status(201).json(result)
+    } catch (error) { await client.query('rollback'); throw error } finally { client.release() }
+  } catch (error) { sendApiError(res, error) }
+}
+
 async function refund(req: import('express').Request, res: import('express').Response) {
   try {
     const orderId = id(req.params.id, 'Order ID')
@@ -313,4 +412,5 @@ async function refund(req: import('express').Request, res: import('express').Res
 
 ordersRouter.post('/push', (req, res) => void push(req, res))
 terminalOrdersRouter.post('/push', (req, res) => void push(req, res, true))
+ordersRouter.post('/:id/returns', (req, res) => void createReturn(req, res))
 ordersRouter.post('/:id/refund', (req, res) => void refund(req, res))
