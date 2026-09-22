@@ -33,6 +33,8 @@ schema no longer matches history, and it needs manual reconciliation, not a sile
 | 202609190002_remove_demo_catalog_seed.sql | `3a53091f607da9d43874458a7cd3e9f01ae78f1b7c372b536dd3ee3961d18443` | yes | function `pos_seed_new_store` is absent (dropped) |
 | 202609190003_store_sync_feed_init.sql | `8039268781ce168ec2887fd409ea620291565e30e8248b10eac52b9b76e916e2` | yes | function `pos_init_store_sync_state` exists |
 | 202609200001_service_role_only_rls_policies.sql | `c5d91c60277e769cfd13c295a781ab5a0302082967d696bafd4bb7839d5731b1` | yes | policy `pos_change_feed_service_role_only` exists |
+| 202609220001_inventory_operations.sql | `91f0cffdb39c121e961f3fee90e91cf2b262f19119a03768e3e303fe04ef9dd3` | yes | `public.pos_cycle_counts` table exists |
+| 202609220002_returns_and_exchanges.sql | `1f0efd67e9c146112f870ab643b1a55608982ae573454ec148611fe07d3841d3` | yes | `pos_refunds.operation_id` column exists |
 
 No pending or applied-but-missing-from-repo migrations were found: all 15 files map to a
 confirmed live object, and no live object was found that isn't explained by one of these files.
