@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { calculateDiscountedLine, calculateLine, discountNeedsManagerApproval, formatCents, parseCents, sumDiscountedLines, sumLines } from './money.ts'
+import { allocateReturnCents, calculateDiscountedLine, calculateLine, discountNeedsManagerApproval, formatCents, parseCents, sumDiscountedLines, sumLines } from './money.ts'
 
 test('rounds tax half up in integer cents', () => {
   assert.equal(calculateLine(10, 1, 500).taxCents, 1)
@@ -42,4 +42,10 @@ test('20% discount is within cashier authority; anything above needs manager app
   assert.equal(discountNeedsManagerApproval(1_000, 201), true)
   assert.equal(discountNeedsManagerApproval(1_000, 250), true)
   assert.equal(discountNeedsManagerApproval(1_000, 0), false)
+})
+test('partial-return allocations reconcile a line total exactly', () => {
+  assert.equal(allocateReturnCents(1000, 3, 0, 1), 333)
+  assert.equal(allocateReturnCents(1000, 3, 1, 1), 333)
+  assert.equal(allocateReturnCents(1000, 3, 2, 1), 334)
+  assert.throws(() => allocateReturnCents(1000, 3, 2, 2), /exceeds the quantity sold/)
 })

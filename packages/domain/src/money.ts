@@ -70,6 +70,20 @@ export function sumDiscountedLines(lines: ReturnType<typeof calculateDiscountedL
   }), { subtotalCents: 0, discountCents: 0, taxCents: 0, totalCents: 0 })
 }
 
+/** Allocates an original integer-cent line component to a new partial return.
+ * Cumulative allocation guarantees that successive returns add up to the original
+ * line amount exactly, including any remainder cent on the final returned unit. */
+export function allocateReturnCents(totalCents: number, soldQuantity: number, previouslyReturnedQuantity: number, returningQuantity: number): number {
+  boundedInteger(totalCents, 'Line amount', 0, MAX_CENTS)
+  boundedInteger(soldQuantity, 'Sold quantity', 1, 10_000)
+  boundedInteger(previouslyReturnedQuantity, 'Previously returned quantity', 0, soldQuantity)
+  boundedInteger(returningQuantity, 'Return quantity', 1, soldQuantity)
+  if (previouslyReturnedQuantity + returningQuantity > soldQuantity) throw new Error('Return quantity exceeds the quantity sold.')
+  const before = Math.floor(totalCents * previouslyReturnedQuantity / soldQuantity)
+  const after = Math.floor(totalCents * (previouslyReturnedQuantity + returningQuantity) / soldQuantity)
+  return boundedInteger(after - before, 'Allocated return amount', 0, MAX_CENTS)
+}
+
 export function parseCents(input: string): number {
   const normalized = input.trim()
   if (!/^(?:0|[1-9]\d{0,7})(?:\.\d{1,2})?$/.test(normalized)) throw new Error('Enter a valid amount with up to two decimal places.')
